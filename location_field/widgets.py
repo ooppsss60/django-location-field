@@ -5,6 +5,7 @@ from django import forms
 from django.conf import settings
 from django.forms import widgets
 from django.template.loader import render_to_string
+from django.templatetags.static import static
 from django.utils.safestring import mark_safe
 
 
@@ -65,4 +66,4 @@ class LocationWidget(widgets.TextInput):
 
     @property
     def media(self):
-        return forms.Media(**settings.LOCATION_FIELD["resources.media"])
+        return forms.Media(js=[static('location_field/js/form.js')])
