@@ -66,4 +66,9 @@ class LocationWidget(widgets.TextInput):
 
     @property
     def media(self):
-        return forms.Media(js=[static('location_field/js/form.js')])
+        media = settings.LOCATION_FIELD.get("resources.media", {})
+
+        return forms.Media(
+            js=media.get("js", [static("location_field/js/form.js")]),
+            css=media.get("css", {}),
+        )
