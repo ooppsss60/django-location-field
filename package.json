@@ -1,5 +1,5 @@
 {
   "dependencies": {
-    "leaflet-geosearch": "^3.7.0"
+    "@googlemaps/js-api-loader": "^1.15.1"
   }
 }

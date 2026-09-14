@@ -1,45 +1,33 @@
 var SequentialLoader = function() {
     var SL = {
         loadJS: function(src, onload) {
-            //console.log(src);
-            // add to pending list
             this._load_pending.push({'src': src, 'onload': onload});
-            // check if not already loading
-            if ( ! this._loading) {
+            if (!this._loading) {
                 this._loading = true;
-                // load first
                 this.loadNextJS();
             }
         },
 
         loadNextJS: function() {
-            // get next
             var next = this._load_pending.shift();
             if (next == undefined) {
-                // nothing to load
                 this._loading = false;
                 return;
             }
-            // check not loaded
             if (this._load_cache[next.src] != undefined) {
                 next.onload();
                 this.loadNextJS();
-                return; // already loaded
+                return;
             }
-            else {
-                this._load_cache[next.src] = 1;
-            }
-            // load
+            this._load_cache[next.src] = 1;
+
             var el = document.createElement('script');
             el.type = 'application/javascript';
             el.src = next.src;
-            // onload callback
+
             var self = this;
             el.onload = function(){
-                //console.log('Loaded: ' + next.src);
-                // trigger onload
                 next.onload();
-                // try to load next
                 self.loadNextJS();
             };
             document.body.appendChild(el);
@@ -52,19 +40,388 @@ var SequentialLoader = function() {
 
     return {
         loadJS: SL.loadJS.bind(SL)
-    }
+    };
 };
 
 
 !function($){
-    var LocationFieldCache = {
-        load: [],
-        onload: {},
+    var LocationFieldResourceLoader;
 
-        isLoading: false
+    function LatLng(lat, lng) {
+        this.lat = parseFloat(lat) || 0;
+        this.lng = parseFloat(lng) || 0;
+    }
+
+    function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+    }
+
+    function requestJSON(url, onload, onerror) {
+        var request = new XMLHttpRequest();
+        request.open('GET', url, true);
+        request.onload = function() {
+            if (request.status >= 200 && request.status < 400) {
+                onload(JSON.parse(request.responseText));
+            }
+            else if (onerror) {
+                onerror();
+            }
+        };
+        request.onerror = onerror || function(){};
+        request.send();
+    }
+
+    function TileMap(element, options, providerOptions) {
+        this.element = element;
+        this.provider = options.provider;
+        this.providerOptions = providerOptions || {};
+        this.center = options.center;
+        this.zoom = options.zoom || 13;
+        this.maxZoom = options.maxZoom || 18;
+        this.marker = null;
+        this.onClick = null;
+        this.dragging = false;
+
+        this._render();
+        this._bindEvents();
+        this._draw();
+    }
+
+    TileMap.prototype = {
+        _render: function() {
+            this.element.style.position = 'relative';
+            this.element.style.overflow = 'hidden';
+            this.element.style.background = '#e5e3df';
+            this.element.style.cursor = 'grab';
+            this.element.innerHTML = '';
+
+            this.tilePane = document.createElement('div');
+            this.tilePane.style.position = 'absolute';
+            this.tilePane.style.inset = '0';
+            this.element.appendChild(this.tilePane);
+
+            this.controls = document.createElement('div');
+            this.controls.style.position = 'absolute';
+            this.controls.style.top = '10px';
+            this.controls.style.left = '10px';
+            this.controls.style.zIndex = '3';
+            this.controls.style.display = 'grid';
+            this.controls.style.border = '1px solid #aaa';
+            this.controls.style.background = '#fff';
+            this.controls.style.boxShadow = '0 1px 4px rgba(0,0,0,.3)';
+            this.element.appendChild(this.controls);
+
+            this._addZoomButton('+', 1);
+            this._addZoomButton('-', -1);
+        },
+
+        _addZoomButton: function(label, delta) {
+            var self = this;
+            var button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.style.width = '28px';
+            button.style.height = '28px';
+            button.style.border = '0';
+            button.style.borderBottom = delta > 0 ? '1px solid #ccc' : '0';
+            button.style.background = '#fff';
+            button.style.font = 'bold 18px/1 Arial, sans-serif';
+            button.style.cursor = 'pointer';
+            button.onclick = function(event) {
+                event.preventDefault();
+                self.setZoom(self.zoom + delta);
+            };
+            this.controls.appendChild(button);
+        },
+
+        _bindEvents: function() {
+            var self = this;
+            var eventPoint = function(event) {
+                var pointEvent = event.touches && event.touches.length ? event.touches[0] : event;
+                return {x: pointEvent.clientX, y: pointEvent.clientY};
+            };
+
+            this.element.addEventListener('click', function(event) {
+                if (self.dragging) {
+                    return;
+                }
+                if (event.target.tagName.toLowerCase() === 'button') {
+                    return;
+                }
+                if (self.onClick) {
+                    self.onClick(self.containerPointToLatLng(event.offsetX, event.offsetY));
+                }
+            });
+
+            this.element.addEventListener('mousedown', function(event) {
+                if (event.target.tagName.toLowerCase() === 'button') {
+                    return;
+                }
+                var point = eventPoint(event);
+                self.dragStart = {x: point.x, y: point.y, center: self.project(self.center)};
+                self.element.style.cursor = 'grabbing';
+            });
+
+            this.element.addEventListener('touchstart', function(event) {
+                if (event.target.tagName.toLowerCase() === 'button') {
+                    return;
+                }
+                var point = eventPoint(event);
+                self.dragStart = {x: point.x, y: point.y, center: self.project(self.center)};
+            });
+
+            var moveMap = function(event) {
+                if (!self.dragStart || self.markerDragging) {
+                    return;
+                }
+                var point = eventPoint(event);
+                var dx = point.x - self.dragStart.x;
+                var dy = point.y - self.dragStart.y;
+                if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+                    self.dragging = true;
+                }
+                self.center = self.unproject({
+                    x: self.dragStart.center.x - dx,
+                    y: self.dragStart.center.y - dy
+                });
+                self._draw();
+            };
+
+            var stopMap = function() {
+                self.dragStart = null;
+                self.element.style.cursor = 'grab';
+                setTimeout(function(){ self.dragging = false; }, 0);
+            };
+
+            document.addEventListener('mousemove', moveMap);
+            document.addEventListener('touchmove', moveMap);
+            document.addEventListener('mouseup', stopMap);
+            document.addEventListener('touchend', stopMap);
+
+            this.element.addEventListener('wheel', function(event) {
+                event.preventDefault();
+                self.setZoom(self.zoom + (event.deltaY < 0 ? 1 : -1));
+            });
+        },
+
+        _tileUrl: function(x, y, z) {
+            if (this.provider === 'mapbox') {
+                var id = this.providerOptions.id || 'mapbox/streets-v11';
+                return 'https://api.mapbox.com/styles/v1/' + id + '/tiles/' + z + '/' + x + '/' + y + '?access_token=' + this.providerOptions.access_token;
+            }
+            var subdomain = ['a', 'b', 'c'][Math.abs(x + y) % 3];
+            return 'https://' + subdomain + '.tile.openstreetmap.org/' + z + '/' + x + '/' + y + '.png';
+        },
+
+        _draw: function() {
+            var width = this.element.clientWidth;
+            var height = this.element.clientHeight;
+            var center = this.project(this.center);
+            var topLeft = {x: center.x - width / 2, y: center.y - height / 2};
+            var tileSize = 256;
+            var firstX = Math.floor(topLeft.x / tileSize);
+            var firstY = Math.floor(topLeft.y / tileSize);
+            var lastX = Math.floor((topLeft.x + width) / tileSize);
+            var lastY = Math.floor((topLeft.y + height) / tileSize);
+            var limit = Math.pow(2, this.zoom);
+
+            this.tilePane.innerHTML = '';
+            for (var x = firstX; x <= lastX; x++) {
+                for (var y = firstY; y <= lastY; y++) {
+                    if (y < 0 || y >= limit) {
+                        continue;
+                    }
+                    var wrappedX = ((x % limit) + limit) % limit;
+                    var img = document.createElement('img');
+                    img.draggable = false;
+                    img.src = this._tileUrl(wrappedX, y, this.zoom);
+                    img.style.position = 'absolute';
+                    img.style.width = tileSize + 'px';
+                    img.style.height = tileSize + 'px';
+                    img.style.left = (x * tileSize - topLeft.x) + 'px';
+                    img.style.top = (y * tileSize - topLeft.y) + 'px';
+                    this.tilePane.appendChild(img);
+                }
+            }
+
+            if (this.marker) {
+                this.marker._position();
+            }
+        },
+
+        project: function(latLng) {
+            var siny = clamp(Math.sin(latLng.lat * Math.PI / 180), -0.9999, 0.9999);
+            var scale = 256 * Math.pow(2, this.zoom);
+            return {
+                x: scale * (0.5 + latLng.lng / 360),
+                y: scale * (0.5 - Math.log((1 + siny) / (1 - siny)) / (4 * Math.PI))
+            };
+        },
+
+        unproject: function(point) {
+            var scale = 256 * Math.pow(2, this.zoom);
+            var lng = (point.x / scale - 0.5) * 360;
+            var lat = (2 * Math.atan(Math.exp((0.5 - point.y / scale) * 2 * Math.PI)) - Math.PI / 2) * 180 / Math.PI;
+            return new LatLng(lat, lng);
+        },
+
+        containerPointToLatLng: function(x, y) {
+            var center = this.project(this.center);
+            return this.unproject({
+                x: center.x - this.element.clientWidth / 2 + x,
+                y: center.y - this.element.clientHeight / 2 + y
+            });
+        },
+
+        latLngToContainerPoint: function(latLng) {
+            var center = this.project(this.center);
+            var point = this.project(latLng);
+            return {
+                x: point.x - center.x + this.element.clientWidth / 2,
+                y: point.y - center.y + this.element.clientHeight / 2
+            };
+        },
+
+        setZoom: function(zoom) {
+            this.zoom = clamp(zoom, 0, this.maxZoom);
+            this._draw();
+        },
+
+        panTo: function(latLng) {
+            this.center = latLng;
+            this._draw();
+        },
+
+        setMarker: function(marker) {
+            this.marker = marker;
+        }
     };
 
-    var LocationFieldResourceLoader;
+    function TileMarker(map, latLng, onChange) {
+        this.map = map;
+        this.latLng = latLng;
+        this.onChange = onChange;
+        this.element = document.createElement('div');
+        this.element.style.position = 'absolute';
+        this.element.style.width = '25px';
+        this.element.style.height = '41px';
+        this.element.style.marginLeft = '-12px';
+        this.element.style.marginTop = '-41px';
+        this.element.style.zIndex = '2';
+        this.element.style.cursor = 'move';
+        this.element.style.background = 'url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2725%27 height=%2741%27 viewBox=%270 0 25 41%27%3E%3Cpath fill=%27%232a81cb%27 stroke=%27%231b4f87%27 d=%27M12.5 1C6.2 1 1 6.2 1 12.6 1 21.2 12.5 40 12.5 40S24 21.2 24 12.6C24 6.2 18.8 1 12.5 1z%27/%3E%3Ccircle cx=%2712.5%27 cy=%2712.5%27 r=%275%27 fill=%27white%27/%3E%3C/svg%3E") center / contain no-repeat';
+
+        map.element.appendChild(this.element);
+        map.setMarker(this);
+        this._bindEvents();
+        this._position();
+    }
+
+    TileMarker.prototype = {
+        _bindEvents: function() {
+            var self = this;
+            var eventPoint = function(event) {
+                var pointEvent = event.touches && event.touches.length ? event.touches[0] : event;
+                return {x: pointEvent.clientX, y: pointEvent.clientY};
+            };
+            this.element.addEventListener('mousedown', function(event) {
+                event.preventDefault();
+                self.map.markerDragging = true;
+            });
+            this.element.addEventListener('touchstart', function(event) {
+                event.preventDefault();
+                self.map.markerDragging = true;
+            });
+            var moveMarker = function(event) {
+                if (!self.map.markerDragging) {
+                    return;
+                }
+                var point = eventPoint(event);
+                var rect = self.map.element.getBoundingClientRect();
+                self.setPosition(self.map.containerPointToLatLng(point.x - rect.left, point.y - rect.top));
+            };
+            var stopMarker = function() {
+                self.map.markerDragging = false;
+            };
+            document.addEventListener('mousemove', moveMarker);
+            document.addEventListener('touchmove', moveMarker);
+            document.addEventListener('mouseup', stopMarker);
+            document.addEventListener('touchend', stopMarker);
+        },
+
+        _position: function() {
+            var point = this.map.latLngToContainerPoint(this.latLng);
+            this.element.style.left = point.x + 'px';
+            this.element.style.top = point.y + 'px';
+        },
+
+        setPosition: function(latLng) {
+            this.latLng = latLng;
+            this._position();
+            this.onChange(latLng);
+        }
+    };
+
+    function GoogleMapAdapter(element, options, providerOptions) {
+        this.map = new google.maps.Map(element, {
+            center: options.center,
+            zoom: options.zoom,
+            mapTypeId: (providerOptions.mapType || 'ROADMAP').toLowerCase()
+        });
+    }
+
+    GoogleMapAdapter.prototype = {
+        panTo: function(latLng) {
+            this.map.panTo(latLng);
+        },
+
+        onClick: function(callback) {
+            this.map.addListener('click', function(event) {
+                callback(new LatLng(event.latLng.lat(), event.latLng.lng()));
+            });
+        },
+
+        createMarker: function(latLng, onChange) {
+            var marker = new google.maps.Marker({
+                map: this.map,
+                position: latLng,
+                draggable: true
+            });
+            marker.addListener('dragend', function() {
+                var position = marker.getPosition();
+                onChange(new LatLng(position.lat(), position.lng()));
+            });
+            return {
+                setPosition: function(nextLatLng) {
+                    marker.setPosition(nextLatLng);
+                    onChange(nextLatLng);
+                }
+            };
+        }
+    };
+
+    function TileMapAdapter(element, options, providerOptions) {
+        this.map = new TileMap(element, options, providerOptions);
+    }
+
+    TileMapAdapter.prototype = {
+        panTo: function(latLng) {
+            this.map.panTo(latLng);
+        },
+
+        onClick: function(callback) {
+            this.map.onClick = callback;
+        },
+
+        createMarker: function(latLng, onChange) {
+            var marker = new TileMarker(this.map, latLng, onChange);
+            return {
+                setPosition: function(nextLatLng) {
+                    marker.setPosition(nextLatLng);
+                }
+            };
+        }
+    };
 
     $.locationField = function(options) {
         var LocationField = {
@@ -85,39 +442,37 @@ var SequentialLoader = function() {
                 basedFields: $(),
                 inputField: $(),
                 suffix: '',
-                path: '',
-                fixMarker: true
+                path: ''
             }, options),
 
-            providers: /google|openstreetmap|mapbox/,
-            searchProviders: /google|yandex|nominatim|addok/,
+            providers: /^(google|openstreetmap|mapbox)$/,
+            searchProviders: /^(google|yandex|nominatim|addok)$/,
 
             render: function() {
                 this.$id = $('#' + this.options.id);
 
-                if ( ! this.providers.test(this.options.provider)) {
+                if (!this.providers.test(this.options.provider)) {
                     this.error('render failed, invalid map provider: ' + this.options.provider);
                     return;
                 }
 
-                if ( ! this.searchProviders.test(this.options.searchProvider)) {
+                if (!this.searchProviders.test(this.options.searchProvider)) {
                     this.error('render failed, invalid search provider: ' + this.options.searchProvider);
                     return;
                 }
 
                 var self = this;
-
                 this.loadAll(function(){
-                    var mapOptions = self._getMapOptions(),
-                        map = self._getMap(mapOptions);
+                    var mapOptions = self._getMapOptions();
+                    var map = self._getMap(mapOptions);
+                    var marker = map.createMarker(mapOptions.center, function(latLng) {
+                        self.fill(latLng);
+                    });
 
-                    var marker = self._getMarker(map, mapOptions.center);
+                    map.onClick(function(latLng) {
+                        marker.setPosition(latLng);
+                    });
 
-                    // fix issue w/ marker not appearing
-                    if (self.options.provider == 'google' && self.options.fixMarker)
-                        self.__fixMarker();
-
-                    // watch based fields
                     self._watchBasedFields(map, marker);
                 });
             },
@@ -127,182 +482,114 @@ var SequentialLoader = function() {
             },
 
             search: function(map, marker, address) {
-                if (this.options.searchProvider === 'google') {
-                    var provider = new GeoSearch.GoogleProvider({ apiKey: this.options.providerOptions.google.apiKey });
-                    provider.search({query: address}).then(data => {
-                        if (data.length > 0) {
-                            var result = data[0],
-                                latLng = new L.LatLng(result.y, result.x);
+                address = address + (this.options.suffix ? ', ' + this.options.suffix : '');
+                if (!address.replace(/,\s*/g, '').length) {
+                    return;
+                }
 
-                            marker.setLatLng(latLng);
-                            map.panTo(latLng);
+                var self = this;
+                var setLocation = function(latLng) {
+                    marker.setPosition(latLng);
+                    map.panTo(latLng);
+                };
+
+                if (this.options.searchProvider === 'google') {
+                    var geocoder = new google.maps.Geocoder();
+                    geocoder.geocode({address: address}, function(results, status) {
+                        if (status === 'OK' && results.length > 0) {
+                            var location = results[0].geometry.location;
+                            setLocation(new LatLng(location.lat(), location.lng()));
+                        }
+                        else {
+                            console.error('Google geocoder error response: ' + status);
                         }
                     });
                 }
-
                 else if (this.options.searchProvider === 'yandex') {
-                    // https://yandex.com/dev/maps/geocoder/doc/desc/concepts/input_params.html
-                    var url = 'https://geocode-maps.yandex.ru/1.x/?format=json&geocode=' + address;
+                    var url = 'https://geocode-maps.yandex.ru/1.x/?format=json&geocode=' + encodeURIComponent(address);
 
                     if (typeof this.options.providerOptions.yandex.apiKey !== 'undefined') {
-                        url += '&apikey=' + this.options.providerOptions.yandex.apiKey;
+                        url += '&apikey=' + encodeURIComponent(this.options.providerOptions.yandex.apiKey);
                     }
 
-                    var request = new XMLHttpRequest();
-                    request.open('GET', url, true);
-
-                    request.onload = function () {
-                        if (request.status >= 200 && request.status < 400) {
-                            var data = JSON.parse(request.responseText);
-                            var pos = data.response.GeoObjectCollection.featureMember[0].GeoObject.Point.pos.split(' ');
-                            var latLng = new L.LatLng(pos[1], pos[0]);
-                            marker.setLatLng(latLng);
-                            map.panTo(latLng);
-                        } else {
-                            console.error('Yandex geocoder error response');
+                    requestJSON(url, function(data) {
+                        var member = data.response.GeoObjectCollection.featureMember[0];
+                        if (member) {
+                            var pos = member.GeoObject.Point.pos.split(' ');
+                            setLocation(new LatLng(pos[1], pos[0]));
                         }
-                    };
-
-                    request.onerror = function () {
-                        console.error('Check connection to Yandex geocoder');
-                    };
-
-                    request.send();
+                    }, function() {
+                        console.error('Yandex geocoder error response');
+                    });
                 }
-
                 else if (this.options.searchProvider === 'addok') {
-                    var url = 'https://api-adresse.data.gouv.fr/search/?limit=1&q=' + address;
-
-                    var request = new XMLHttpRequest();
-                    request.open('GET', url, true);
-
-                    request.onload = function () {
-                        if (request.status >= 200 && request.status < 400) {
-                            var data = JSON.parse(request.responseText);
+                    requestJSON('https://api-adresse.data.gouv.fr/search/?limit=1&q=' + encodeURIComponent(address), function(data) {
+                        if (data.features && data.features.length > 0) {
                             var pos = data.features[0].geometry.coordinates;
-                            var latLng = new L.LatLng(pos[1], pos[0]);
-                            marker.setLatLng(latLng);
-                            map.panTo(latLng);
-                        } else {
-                            console.error('Addok geocoder error response');
+                            setLocation(new LatLng(pos[1], pos[0]));
                         }
-                    };
-
-                    request.onerror = function () {
-                        console.error('Check connection to Addok geocoder');
-                    };
-
-                    request.send();
+                    }, function() {
+                        console.error('Addok geocoder error response');
+                    });
                 }
-
                 else if (this.options.searchProvider === 'nominatim') {
-                    var url = '//nominatim.openstreetmap.org/search?format=json&q=' + address;
-
-                    var request = new XMLHttpRequest();
-                    request.open('GET', url, true);
-
-                    request.onload = function () {
-                        if (request.status >= 200 && request.status < 400) {
-                            var data = JSON.parse(request.responseText);
-                            if (data.length > 0) {
-                                var pos = data[0];
-                                var latLng = new L.LatLng(pos.lat, pos.lon);
-                                marker.setLatLng(latLng);
-                                map.panTo(latLng);
-                            } else {
-                                console.error(address + ': not found via Nominatim');
-                            }
-                        } else {
-                            console.error('Nominatim geocoder error response');
+                    requestJSON('https://nominatim.openstreetmap.org/search?format=json&q=' + encodeURIComponent(address), function(data) {
+                        if (data.length > 0) {
+                            setLocation(new LatLng(data[0].lat, data[0].lon));
                         }
-                    };
-
-                    request.onerror = function () {
-                        console.error('Check connection to Nominatim geocoder');
-                    };
-
-                    request.send();
+                        else {
+                            console.error(address + ': not found via Nominatim');
+                        }
+                    }, function() {
+                        console.error('Nominatim geocoder error response');
+                    });
                 }
             },
 
             loadAll: function(onload) {
                 this.$id.html('Loading...');
 
-                // resource loader
-                if (LocationFieldResourceLoader == undefined)
+                if (LocationFieldResourceLoader == undefined) {
                     LocationFieldResourceLoader = SequentialLoader();
+                }
 
                 this.load.loader = LocationFieldResourceLoader;
                 this.load.path = this.options.path;
 
                 var self = this;
-
-                this.load.common(function(){
-                    var mapProvider = self.options.provider,
-                        onLoadMapProvider = function() {
-                            var searchProvider = self.options.searchProvider + 'SearchProvider',
-                                onLoadSearchProvider = function() {
-                                    self.$id.html('');
-                                    onload();
-                                };
-
-                            if (self.load[searchProvider] != undefined) {
-                                self.load[searchProvider](self.options.providerOptions[self.options.searchProvider] || {}, onLoadSearchProvider);
-                            }
-                            else {
-                                onLoadSearchProvider();
-                            }
-                        };
-
-                    if (self.load[mapProvider] != undefined) {
-                        self.load[mapProvider](self.options.providerOptions[mapProvider] || {}, onLoadMapProvider);
+                var mapProvider = self.options.provider;
+                var loadSearchProvider = function() {
+                    if (self.options.searchProvider === 'google' && mapProvider !== 'google') {
+                        self.load.google(self.options.providerOptions.google || {}, function() {
+                            self.$id.html('');
+                            onload();
+                        });
                     }
                     else {
-                        onLoadMapProvider();
+                        self.$id.html('');
+                        onload();
                     }
-                });
+                };
+
+                if (self.load[mapProvider] != undefined) {
+                    self.load[mapProvider](self.options.providerOptions[mapProvider] || {}, loadSearchProvider);
+                }
+                else {
+                    loadSearchProvider();
+                }
             },
 
             load: {
                 google: function(options, onload) {
-                    var js = [
-                        this.path + '/@googlemaps/js-api-loader/index.min.js',
-                        this.path + '/Leaflet.GoogleMutant.js',
-                    ];
-
-                    this._loadJSList(js, function(){
-                        const loader = new google.maps.plugins.loader.Loader({
-                          apiKey: options.apiKey,
-                          version: "weekly",
+                    this._loadJSList([this.path + '/@googlemaps/js-api-loader/index.min.js'], function(){
+                        var loader = new google.maps.plugins.loader.Loader({
+                            apiKey: options.apiKey,
+                            version: 'weekly'
                         });
-                        loader.load().then(() => onload());
+                        loader.load().then(function() {
+                            onload();
+                        });
                     });
-                },
-
-                googleSearchProvider: function(options, onload) {
-                    onload();
-                    //var url = options.api;
-
-                    //if (typeof options.apiKey !== 'undefined') {
-                    //    url += url.indexOf('?') === -1 ? '?' : '&';
-                    //    url += 'key=' + options.apiKey;
-                    //}
-
-                    //var js = [
-                    //        url,
-                    //        this.path + '/l.geosearch.provider.google.js'
-                    //    ];
-
-                    //this._loadJSList(js, function(){
-                    //    // https://github.com/smeijer/L.GeoSearch/issues/57#issuecomment-148393974
-                    //    L.GeoSearch.Provider.Google.Geocoder = new google.maps.Geocoder();
-
-                    //    onload();
-                    //});
-                },
-
-                yandexSearchProvider: function (options, onload) {
-                    onload();
                 },
 
                 mapbox: function(options, onload) {
@@ -313,57 +600,19 @@ var SequentialLoader = function() {
                     onload();
                 },
 
-                common: function(onload) {
-                    var self = this,
-                        js = [
-                            // map providers
-                            this.path + '/leaflet/leaflet.js',
-                            // search providers
-                            this.path + '/leaflet-geosearch/geosearch.umd.js',
-                        ],
-                        css = [
-                            // map providers
-                            this.path + '/leaflet/leaflet.css'
-                        ];
-
-                    // Leaflet docs note:
-                    // Include Leaflet JavaScript file *after* Leaflet’s CSS
-                    // https://leafletjs.com/examples/quick-start/
-                    this._loadCSSList(css, function(){
-                        self._loadJSList(js, onload);
-                    });
-                },
-
                 _loadJS: function(src, onload) {
                     this.loader.loadJS(src, onload);
                 },
 
                 _loadJSList: function(srclist, onload) {
-                    this.__loadList(this._loadJS, srclist, onload);
-                },
-
-                _loadCSS: function(src, onload) {
-                    if (LocationFieldCache.onload[src] != undefined) {
+                    if (srclist.length === 0) {
                         onload();
+                        return;
                     }
-                    else {
-                        LocationFieldCache.onload[src] = 1;
-                        onloadCSS(loadCSS(src), onload);
+                    for (var i = 0; i < srclist.length - 1; ++i) {
+                        this._loadJS(srclist[i], function(){});
                     }
-                },
-
-                _loadCSSList: function(srclist, onload) {
-                    this.__loadList(this._loadCSS, srclist, onload);
-                },
-
-                __loadList: function(fn, srclist, onload) {
-                    if (srclist.length > 1) {
-                        for (var i = 0; i < srclist.length-1; ++i) {
-                            fn.call(this, srclist[i], function(){});
-                        }
-                    }
-
-                    fn.call(this, srclist[srclist.length-1], onload);
+                    this._loadJS(srclist[srclist.length - 1], onload);
                 }
             },
 
@@ -373,31 +622,14 @@ var SequentialLoader = function() {
             },
 
             _getMap: function(mapOptions) {
-                var map = new L.Map(this.options.id, mapOptions), layer;
-
-                if (this.options.provider == 'google') {
-                    layer = new L.gridLayer.googleMutant({
-                        type: this.options.providerOptions.google.mapType.toLowerCase(),
-                    });
+                var element = document.getElementById(this.options.id);
+                if (this.options.provider === 'google') {
+                    return new GoogleMapAdapter(element, mapOptions, this.options.providerOptions.google);
                 }
-                else if (this.options.provider == 'openstreetmap') {
-                    layer = new L.tileLayer(
-                        '//{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                            maxZoom: 18
-                        });
-                }
-                else if (this.options.provider == 'mapbox') {
-                    layer = new L.tileLayer(
-                        'https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}', {
-                            maxZoom: 18,
-                            accessToken: this.options.providerOptions.mapbox.access_token,
-                            id: 'mapbox/streets-v11'
-                        });
-                }
-
-                map.addLayer(layer);
-
-                return map;
+                return new TileMapAdapter(element, $.extend(mapOptions, {
+                    provider: this.options.provider,
+                    maxZoom: this.options.providerOptions[this.options.provider].maxZoom
+                }), this.options.providerOptions[this.options.provider]);
             },
 
             _getMapOptions: function() {
@@ -408,123 +640,103 @@ var SequentialLoader = function() {
 
             _getLatLng: function() {
                 var l = this.options.latLng.split(',').map(parseFloat);
-                return new L.LatLng(l[0], l[1]);
-            },
-
-            _getMarker: function(map, center) {
-                var self = this,
-                    markerOptions = {
-                        draggable: true
-                    };
-
-                var marker = L.marker(center, markerOptions).addTo(map);
-
-                // fill input on dragend
-                marker.on('dragend move', function(){
-                    self.fill(this.getLatLng());
-                });
-
-                // place marker on map click
-                map.on('click', function(e){
-                    marker.setLatLng(e.latlng);
-                });
-
-                return marker;
+                return new LatLng(l[0], l[1]);
             },
 
             _watchBasedFields: function(map, marker) {
-                var self = this,
-                    basedFields = this.options.basedFields,
-                    onchangeTimer,
-                    onchange = function() {
-                        var values = basedFields.map(function() {
-                            var value = $(this).val();
-                            return value === '' ? null : value;
-                        });
-                        var address = values.toArray().join(', ');
-                        clearTimeout(onchangeTimer);
-                        onchangeTimer = setTimeout(function(){
-                            self.search(map, marker, address);
-                        }, 300);
-                    };
+                var self = this;
+                var basedFields = this.options.basedFields;
+                var onchangeTimer;
+                var onchange = function() {
+                    var values = basedFields.map(function() {
+                        var value = $(this).val();
+                        return value === '' ? null : value;
+                    });
+                    var address = values.toArray().join(', ');
+                    clearTimeout(onchangeTimer);
+                    onchangeTimer = setTimeout(function(){
+                        self.search(map, marker, address);
+                    }, 300);
+                };
 
                 basedFields.each(function(){
                     var el = $(this);
 
-                    if (el.is('select'))
+                    if (el.is('select')) {
                         el.change(onchange);
-                    else
+                    }
+                    else {
                         el.keyup(onchange);
+                    }
                 });
-            },
-
-            __fixMarker: function() {
-                $('.leaflet-map-pane').css('z-index', '2 !important');
-                $('.leaflet-google-layer').css('z-index', '1 !important');
             }
-        }
+        };
 
         return {
             render: LocationField.render.bind(LocationField)
-        }
-    }
+        };
+    };
 
     function dataLocationFieldObserver(callback) {
-      function _findAndEnableDataLocationFields() {
-        var dataLocationFields = $('input[data-location-field-options]');
+        function _findAndEnableDataLocationFields() {
+            var dataLocationFields = $('input[data-location-field-options]');
 
-        dataLocationFields
-          .filter(':not([data-location-field-observed])')
-          .attr('data-location-field-observed', true)
-          .each(callback);
-      }
+            dataLocationFields
+                .filter(':not([data-location-field-observed])')
+                .attr('data-location-field-observed', true)
+                .each(callback);
+        }
 
-      var observer = new MutationObserver(function(mutations){
-        _findAndEnableDataLocationFields();
-      });
+        var observer = new MutationObserver(function(){
+            _findAndEnableDataLocationFields();
+        });
 
-      var container = document.documentElement || document.body;
+        var container = document.documentElement || document.body;
 
-      $(container).ready(function(){
-        _findAndEnableDataLocationFields();
-      });
+        $(container).ready(function(){
+            _findAndEnableDataLocationFields();
+        });
 
-      observer.observe(container, {attributes: true});
+        observer.observe(container, {attributes: true, childList: true, subtree: true});
     }
 
     dataLocationFieldObserver(function(){
         var el = $(this);
 
-        var name = el.attr('name'),
-            options = el.data('location-field-options'),
-            basedFields = options.field_options.based_fields,
-            pluginOptions = {
-                id: 'map_' + name,
-                inputField: el,
-                latLng: el.val() || '0,0',
-                suffix: options['search.suffix'],
-                path: options['resources.root_path'],
-                provider: options['map.provider'],
-                searchProvider: options['search.provider'],
-                providerOptions: {
-                    google: {
-                        api: options['provider.google.api'],
-                        apiKey: options['provider.google.api_key'],
-                        mapType: options['provider.google.map_type']
-                    },
-                    mapbox: {
-                        access_token: options['provider.mapbox.access_token']
-                    },
-                    yandex: {
-                        apiKey: options['provider.yandex.api_key']
-                    },
+        var name = el.attr('name');
+        var options = el.data('location-field-options');
+        var basedFields = options.field_options.based_fields;
+        var pluginOptions = {
+            id: 'map_' + name,
+            inputField: el,
+            latLng: el.val() || '0,0',
+            suffix: options['search.suffix'],
+            path: options['resources.root_path'],
+            provider: options['map.provider'],
+            searchProvider: options['search.provider'],
+            providerOptions: {
+                google: {
+                    api: options['provider.google.api'],
+                    apiKey: options['provider.google.api_key'],
+                    mapType: options['provider.google.map_type']
                 },
-                mapOptions: {
-                    zoom: options['map.zoom']
+                mapbox: {
+                    access_token: options['provider.mapbox.access_token'],
+                    maxZoom: options['provider.mapbox.max_zoom'],
+                    id: options['provider.mapbox.id']
+                },
+                openstreetmap: {
+                    maxZoom: options['provider.openstreetmap.max_zoom']
+                },
+                yandex: {
+                    apiKey: options['provider.yandex.api_key']
                 }
-            };
+            },
+            mapOptions: {
+                zoom: options['map.zoom']
+            }
+        };
 
-        // prefix
         var prefixNumber;
 
         try {
@@ -539,112 +751,15 @@ var SequentialLoader = function() {
             }
 
             basedFields = basedFields.map(function(n){
-                return prefix + n
+                return prefix + n;
             });
         }
 
-        // based fields
         pluginOptions.basedFields = $(basedFields.map(function(n){
-            return '#id_' + n
+            return '#id_' + n;
         }).join(','));
 
-        // render
         $.locationField(pluginOptions).render();
     });
 
 }(jQuery || django.jQuery);
-
-/*!
-loadCSS: load a CSS file asynchronously.
-[c]2015 @scottjehl, Filament Group, Inc.
-Licensed MIT
-*/
-(function(w){
-	"use strict";
-	/* exported loadCSS */
-	var loadCSS = function( href, before, media ){
-		// Arguments explained:
-		// `href` [REQUIRED] is the URL for your CSS file.
-		// `before` [OPTIONAL] is the element the script should use as a reference for injecting our stylesheet <link> before
-			// By default, loadCSS attempts to inject the link after the last stylesheet or script in the DOM. However, you might desire a more specific location in your document.
-		// `media` [OPTIONAL] is the media type or query of the stylesheet. By default it will be 'all'
-		var doc = w.document;
-		var ss = doc.createElement( "link" );
-		var ref;
-		if( before ){
-			ref = before;
-		}
-		else {
-			var refs = ( doc.body || doc.getElementsByTagName( "head" )[ 0 ] ).childNodes;
-			ref = refs[ refs.length - 1];
-		}
-
-		var sheets = doc.styleSheets;
-		ss.rel = "stylesheet";
-		ss.href = href;
-		// temporarily set media to something inapplicable to ensure it'll fetch without blocking render
-		ss.media = "only x";
-
-		// Inject link
-			// Note: the ternary preserves the existing behavior of "before" argument, but we could choose to change the argument to "after" in a later release and standardize on ref.nextSibling for all refs
-			// Note: `insertBefore` is used instead of `appendChild`, for safety re: http://www.paulirish.com/2011/surefire-dom-element-insertion/
-		ref.parentNode.insertBefore( ss, ( before ? ref : ref.nextSibling ) );
-		// A method (exposed on return object for external use) that mimics onload by polling until document.styleSheets until it includes the new sheet.
-		var onloadcssdefined = function( cb ){
-			var resolvedHref = ss.href;
-			var i = sheets.length;
-			while( i-- ){
-				if( sheets[ i ].href === resolvedHref ){
-					return cb();
-				}
-			}
-			setTimeout(function() {
-				onloadcssdefined( cb );
-			});
-		};
-
-		// once loaded, set link's media back to `all` so that the stylesheet applies once it loads
-		ss.onloadcssdefined = onloadcssdefined;
-		onloadcssdefined(function() {
-			ss.media = media || "all";
-		});
-		return ss;
-	};
-	// commonjs
-	if( typeof module !== "undefined" ){
-		module.exports = loadCSS;
-	}
-	else {
-		w.loadCSS = loadCSS;
-	}
-}( typeof global !== "undefined" ? global : this ));
-
-
-/*!
-onloadCSS: adds onload support for asynchronous stylesheets loaded with loadCSS.
-[c]2014 @zachleat, Filament Group, Inc.
-Licensed MIT
-*/
-
-/* global navigator */
-/* exported onloadCSS */
-function onloadCSS( ss, callback ) {
-	ss.onload = function() {
-		ss.onload = null;
-		if( callback ) {
-			callback.call( ss );
-		}
-	};
-
-	// This code is for browsers that don’t support onload, any browser that
-	// supports onload should use that instead.
-	// No support for onload:
-	//	* Android 4.3 (Samsung Galaxy S4, Browserstack)
-	//	* Android 4.2 Browser (Samsung Galaxy SIII Mini GT-I8200L)
-	//	* Android 2.3 (Pantech Burst P9070)
-
-	// Weak inference targets Android < 4.4
-	if( "isApplicationInstalled" in navigator && "onloadcssdefined" in ss ) {
-		ss.onloadcssdefined( callback );
-	}
-}
