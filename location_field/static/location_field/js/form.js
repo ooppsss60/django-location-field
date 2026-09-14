@@ -117,6 +117,37 @@ var SequentialLoader = function() {
 
             this._addZoomButton('+', 1);
             this._addZoomButton('-', -1);
+
+
+            if (this.provider === 'openstreetmap') {
+                var attribution = document.createElement('div');
+                attribution.className = 'location-field-attribution';
+                attribution.style.position = 'absolute';
+                attribution.style.bottom = '0';
+                attribution.style.right = '0';
+                attribution.style.zIndex = '3';
+                attribution.style.padding = '2px 5px';
+                attribution.style.background = 'rgba(255,255,255,0.9)';
+                attribution.style.color = '#222';
+                attribution.style.font = '12px/1.4 Arial, sans-serif';
+                attribution.style.cursor = 'auto';
+                attribution.appendChild(document.createTextNode('© '));
+                var link = document.createElement('a');
+                link.href = 'https://www.openstreetmap.org/copyright';
+                link.textContent = 'OpenStreetMap contributors';
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.style.color = '#005a8c';
+                link.style.textDecoration = 'underline';
+                attribution.appendChild(link);
+                // Following the attribution must not move the map or select a location.
+                ['click', 'mousedown', 'touchstart', 'keydown', 'wheel'].forEach(function(type) {
+                    attribution.addEventListener(type, function(event) {
+                        event.stopPropagation();
+                    });
+                });
+                this.element.appendChild(attribution);
+            }
         },
 
         _addZoomButton: function(label, delta) {
@@ -295,8 +326,7 @@ var SequentialLoader = function() {
                 }
                 return 'https://api.mapbox.com/styles/v1/' + id + '/tiles/256/' + z + '/' + x + '/' + y + '?access_token=' + encodeURIComponent(this.providerOptions.access_token);
             }
-            var subdomain = ['a', 'b', 'c'][Math.abs(x + y) % 3];
-            return 'https://' + subdomain + '.tile.openstreetmap.org/' + z + '/' + x + '/' + y + '.png';
+            return 'https://tile.openstreetmap.org/' + z + '/' + x + '/' + y + '.png';
         },
 
         _draw: function() {
@@ -325,6 +355,10 @@ var SequentialLoader = function() {
                         img = document.createElement('img');
                         img.draggable = false;
                         img.alt = '';
+                        if (this.provider === 'openstreetmap') {
+                            // OSM needs a Referer; disclose only the origin, not admin paths.
+                            img.referrerPolicy = 'strict-origin-when-cross-origin';
+                        }
                         img.src = this._tileUrl(wrappedX, y, this.zoom);
                         img.style.position = 'absolute';
                         img.style.width = tileSize + 'px';

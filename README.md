@@ -85,3 +85,17 @@ Screenshot
 ---
 
 [Nick Frost](https://www.iconfinder.com/Gimpopo) has credit over the [image](django-location-field.png) used as logo for this project. [CC BY](https://creativecommons.org/licenses/by/3.0/)
+
+OpenStreetMap tiles
+--
+
+The OpenStreetMap widget uses `https://tile.openstreetmap.org/{z}/{x}/{y}.png`
+and displays linked contributor attribution. Tile images set
+`referrerPolicy="strict-origin-when-cross-origin"` before loading, so cross-origin
+requests send the site's origin without admin paths or query parameters, even
+when the page uses `Referrer-Policy: same-origin`. No global Django referrer
+setting is required. Serve the widget over HTTP(S); local `file://` pages and
+browser privacy tools that remove referrers may still be blocked.
+
+Use must comply with the [OSM tile usage policy](https://operations.osmfoundation.org/policies/tiles/).
+After upgrading, run `collectstatic` where applicable and refresh cached static assets.
