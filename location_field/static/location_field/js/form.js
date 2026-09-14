@@ -76,8 +76,9 @@ var SequentialLoader = function() {
         this.provider = options.provider;
         this.providerOptions = providerOptions || {};
         this.center = options.center;
-        this.zoom = options.zoom || 13;
-        this.maxZoom = options.maxZoom || 18;
+        this.maxZoom = options.maxZoom == null ? 18 : options.maxZoom;
+        this.zoom = clamp(options.zoom == null ? 13 : options.zoom, 0, this.maxZoom);
+        this.tiles = {};
         this.marker = null;
         this.onClick = null;
         this.dragging = false;
@@ -93,6 +94,9 @@ var SequentialLoader = function() {
             this.element.style.overflow = 'hidden';
             this.element.style.background = '#e5e3df';
             this.element.style.cursor = 'grab';
+            this.element.style.touchAction = 'none';
+            this.element.tabIndex = 0;
+            this.element.setAttribute('aria-label', 'Location map');
             this.element.innerHTML = '';
 
             this.tilePane = document.createElement('div');
@@ -120,6 +124,8 @@ var SequentialLoader = function() {
             var button = document.createElement('button');
             button.type = 'button';
             button.textContent = label;
+            button.title = delta > 0 ? 'Zoom in' : 'Zoom out';
+            button.setAttribute('aria-label', button.title);
             button.style.width = '28px';
             button.style.height = '28px';
             button.style.border = '0';
@@ -142,35 +148,62 @@ var SequentialLoader = function() {
             };
 
             this.element.addEventListener('click', function(event) {
-                if (self.dragging) {
+                if (self.dragging || Date.now() < self.suppressClickUntil) {
                     return;
                 }
-                if (event.target.tagName.toLowerCase() === 'button') {
+                if (self.controls.contains(event.target) || (self.marker && self.marker.element.contains(event.target))) {
                     return;
                 }
                 if (self.onClick) {
-                    self.onClick(self.containerPointToLatLng(event.offsetX, event.offsetY));
+                    var point = self.eventPoint(event);
+                    self.onClick(self.containerPointToLatLng(point.x, point.y));
                 }
             });
 
             this.element.addEventListener('mousedown', function(event) {
-                if (event.target.tagName.toLowerCase() === 'button') {
+                if (event.button !== 0 || self.controls.contains(event.target) || self.markerDragging) {
                     return;
                 }
                 var point = eventPoint(event);
+                self.element.focus({preventScroll: true});
                 self.dragStart = {x: point.x, y: point.y, center: self.project(self.center)};
                 self.element.style.cursor = 'grabbing';
             });
 
             this.element.addEventListener('touchstart', function(event) {
-                if (event.target.tagName.toLowerCase() === 'button') {
+                if (self.controls.contains(event.target) || self.markerDragging) {
                     return;
                 }
-                var point = eventPoint(event);
-                self.dragStart = {x: point.x, y: point.y, center: self.project(self.center)};
+                if (event.touches.length === 2) {
+                    var a = self.eventPoint(event.touches[0]);
+                    var b = self.eventPoint(event.touches[1]);
+                    self.pinch = {
+                        distance: Math.hypot(b.x - a.x, b.y - a.y),
+                        zoom: self.zoom,
+                        anchor: self.containerPointToLatLng((a.x + b.x) / 2, (a.y + b.y) / 2)
+                    };
+                    self.dragStart = null;
+                    self.dragging = true;
+                }
+                else if (event.touches.length === 1) {
+                    var point = eventPoint(event);
+                    self.dragStart = {x: point.x, y: point.y, center: self.project(self.center)};
+                }
             });
 
             var moveMap = function(event) {
+                if (self.pinch && event.touches && event.touches.length === 2) {
+                    event.preventDefault();
+                    var a = self.eventPoint(event.touches[0]);
+                    var b = self.eventPoint(event.touches[1]);
+                    var distance = Math.hypot(b.x - a.x, b.y - a.y);
+                    if (distance > 0 && self.pinch.distance > 0) {
+                        self.zoom = clamp(Math.round(self.pinch.zoom + Math.log2(distance / self.pinch.distance)), 0, self.maxZoom);
+                        self._centerOnAnchor(self.pinch.anchor, {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2});
+                        self._draw();
+                    }
+                    return;
+                }
                 if (!self.dragStart || self.markerDragging) {
                     return;
                 }
@@ -180,6 +213,9 @@ var SequentialLoader = function() {
                 if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
                     self.dragging = true;
                 }
+                if (event.touches && self.dragging) {
+                    event.preventDefault();
+                }
                 self.center = self.unproject({
                     x: self.dragStart.center.x - dx,
                     y: self.dragStart.center.y - dy
@@ -187,27 +223,77 @@ var SequentialLoader = function() {
                 self._draw();
             };
 
-            var stopMap = function() {
+            var stopMap = function(event) {
+                if (!self.dragStart && !self.pinch) {
+                    return;
+                }
+                if (self.dragging) {
+                    self.suppressClickUntil = Date.now() + 400;
+                }
+                self.pinch = null;
+                if (event.type === 'touchend' && event.touches.length === 1) {
+                    var point = eventPoint(event);
+                    self.dragStart = {x: point.x, y: point.y, center: self.project(self.center)};
+                    return;
+                }
                 self.dragStart = null;
                 self.element.style.cursor = 'grab';
                 setTimeout(function(){ self.dragging = false; }, 0);
             };
 
             document.addEventListener('mousemove', moveMap);
-            document.addEventListener('touchmove', moveMap);
+            document.addEventListener('touchmove', moveMap, {passive: false});
             document.addEventListener('mouseup', stopMap);
             document.addEventListener('touchend', stopMap);
+            document.addEventListener('touchcancel', stopMap);
 
             this.element.addEventListener('wheel', function(event) {
                 event.preventDefault();
-                self.setZoom(self.zoom + (event.deltaY < 0 ? 1 : -1));
+                if (event.deltaY) {
+                    self.setZoom(self.zoom + (event.deltaY < 0 ? 1 : -1), self.eventPoint(event));
+                }
+            }, {passive: false});
+
+            this.element.addEventListener('dblclick', function(event) {
+                if (self.controls.contains(event.target) || (self.marker && self.marker.element.contains(event.target))) {
+                    return;
+                }
+                event.preventDefault();
+                self.setZoom(self.zoom + (event.shiftKey ? -1 : 1), self.eventPoint(event));
             });
+
+            this.element.addEventListener('keydown', function(event) {
+                if (event.target !== self.element || event.altKey || event.ctrlKey || event.metaKey) {
+                    return;
+                }
+                var offsets = {ArrowLeft: [-80, 0], ArrowRight: [80, 0], ArrowUp: [0, -80], ArrowDown: [0, 80]};
+                var offset = offsets[event.key];
+                if (offset) {
+                    var center = self.project(self.center);
+                    self.panTo(self.unproject({x: center.x + offset[0], y: center.y + offset[1]}));
+                }
+                else if (event.key === '+' || event.key === '=' || event.key === '-') {
+                    self.setZoom(self.zoom + (event.key === '-' ? -1 : 1));
+                }
+                else {
+                    return;
+                }
+                event.preventDefault();
+            });
+        },
+
+        eventPoint: function(event) {
+            var rect = this.element.getBoundingClientRect();
+            return {x: event.clientX - rect.left - this.element.clientLeft, y: event.clientY - rect.top - this.element.clientTop};
         },
 
         _tileUrl: function(x, y, z) {
             if (this.provider === 'mapbox') {
                 var id = this.providerOptions.id || 'mapbox/streets-v11';
-                return 'https://api.mapbox.com/styles/v1/' + id + '/tiles/' + z + '/' + x + '/' + y + '?access_token=' + this.providerOptions.access_token;
+                if (id === 'mapbox.streets') {
+                    id = 'mapbox/streets-v11';
+                }
+                return 'https://api.mapbox.com/styles/v1/' + id + '/tiles/256/' + z + '/' + x + '/' + y + '?access_token=' + encodeURIComponent(this.providerOptions.access_token);
             }
             var subdomain = ['a', 'b', 'c'][Math.abs(x + y) % 3];
             return 'https://' + subdomain + '.tile.openstreetmap.org/' + z + '/' + x + '/' + y + '.png';
@@ -225,22 +311,37 @@ var SequentialLoader = function() {
             var lastY = Math.floor((topLeft.y + height) / tileSize);
             var limit = Math.pow(2, this.zoom);
 
-            this.tilePane.innerHTML = '';
+            var visible = {};
             for (var x = firstX; x <= lastX; x++) {
                 for (var y = firstY; y <= lastY; y++) {
                     if (y < 0 || y >= limit) {
                         continue;
                     }
                     var wrappedX = ((x % limit) + limit) % limit;
-                    var img = document.createElement('img');
-                    img.draggable = false;
-                    img.src = this._tileUrl(wrappedX, y, this.zoom);
-                    img.style.position = 'absolute';
-                    img.style.width = tileSize + 'px';
-                    img.style.height = tileSize + 'px';
+                    var key = this.zoom + '/' + x + '/' + y;
+                    visible[key] = true;
+                    var img = this.tiles[key];
+                    if (!img) {
+                        img = document.createElement('img');
+                        img.draggable = false;
+                        img.alt = '';
+                        img.src = this._tileUrl(wrappedX, y, this.zoom);
+                        img.style.position = 'absolute';
+                        img.style.width = tileSize + 'px';
+                        img.style.height = tileSize + 'px';
+                        img.style.maxWidth = 'none';
+                        this.tiles[key] = img;
+                        this.tilePane.appendChild(img);
+                    }
                     img.style.left = (x * tileSize - topLeft.x) + 'px';
                     img.style.top = (y * tileSize - topLeft.y) + 'px';
-                    this.tilePane.appendChild(img);
+                }
+            }
+
+            for (var key in this.tiles) {
+                if (!visible[key]) {
+                    this.tilePane.removeChild(this.tiles[key]);
+                    delete this.tiles[key];
                 }
             }
 
@@ -282,8 +383,24 @@ var SequentialLoader = function() {
             };
         },
 
-        setZoom: function(zoom) {
-            this.zoom = clamp(zoom, 0, this.maxZoom);
+        _centerOnAnchor: function(anchor, point) {
+            var projected = this.project(anchor);
+            this.center = this.unproject({
+                x: projected.x - point.x + this.element.clientWidth / 2,
+                y: projected.y - point.y + this.element.clientHeight / 2
+            });
+        },
+
+        setZoom: function(zoom, point) {
+            var nextZoom = clamp(zoom, 0, this.maxZoom);
+            if (nextZoom === this.zoom) {
+                return;
+            }
+            var anchor = point && this.containerPointToLatLng(point.x, point.y);
+            this.zoom = nextZoom;
+            if (anchor) {
+                this._centerOnAnchor(anchor, point);
+            }
             this._draw();
         },
 
@@ -325,6 +442,9 @@ var SequentialLoader = function() {
                 return {x: pointEvent.clientX, y: pointEvent.clientY};
             };
             this.element.addEventListener('mousedown', function(event) {
+                if (event.button !== 0) {
+                    return;
+                }
                 event.preventDefault();
                 self.map.markerDragging = true;
             });
@@ -337,16 +457,23 @@ var SequentialLoader = function() {
                     return;
                 }
                 var point = eventPoint(event);
-                var rect = self.map.element.getBoundingClientRect();
-                self.setPosition(self.map.containerPointToLatLng(point.x - rect.left, point.y - rect.top));
+                var local = self.map.eventPoint({clientX: point.x, clientY: point.y});
+                if (event.touches) {
+                    event.preventDefault();
+                }
+                self.setPosition(self.map.containerPointToLatLng(local.x, local.y));
             };
             var stopMarker = function() {
+                if (self.map.markerDragging) {
+                    self.map.suppressClickUntil = Date.now() + 400;
+                }
                 self.map.markerDragging = false;
             };
             document.addEventListener('mousemove', moveMarker);
-            document.addEventListener('touchmove', moveMarker);
+            document.addEventListener('touchmove', moveMarker, {passive: false});
             document.addEventListener('mouseup', stopMarker);
             document.addEventListener('touchend', stopMarker);
+            document.addEventListener('touchcancel', stopMarker);
         },
 
         _position: function() {
